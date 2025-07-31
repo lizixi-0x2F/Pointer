@@ -1,1 +1,0 @@
-{"default": {"features": {"instruction": {"_type": "Value"}, "input": {"_type": "Value"}, "output": {"_type": "Value"}, "text": {"_type": "Value"}}, "splits": {"train": {"name": "train", "dataset_name": "alpaca-gpt4-data-en"}}}}
