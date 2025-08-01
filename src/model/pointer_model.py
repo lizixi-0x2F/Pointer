@@ -141,6 +141,9 @@ class PointerDecoder(nn.Module):
         # Language modeling head
         self.lm_head = nn.Linear(d, vocab_size, bias=False)
         
+        # Pointer supervision head for position prediction
+        self.pointer_head = nn.Linear(d, max_seq_len, bias=False)
+        
         if tie_embeddings:
             self.lm_head.weight = self.embed.weight.weight
         
@@ -178,7 +181,7 @@ class PointerDecoder(nn.Module):
         """Disable gradient checkpointing for the model."""
         self.gradient_checkpointing = False
     
-    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False, cache=None, output_hiddens=False):
+    def forward(self, input_ids, attention_mask=None, labels=None, use_cache=False, cache=None, output_hiddens=False, return_pointer_logits=False):
         """Forward pass for training.
         
         Args:
@@ -188,9 +191,10 @@ class PointerDecoder(nn.Module):
             use_cache (bool): Whether to use/return cache
             cache (Optional[List]): Cache from previous forward passes
             output_hiddens (bool): Whether to return hidden states for distillation
+            return_pointer_logits (bool): Whether to return pointer logits for supervision
             
         Returns:
-            Dict containing logits, loss (if labels provided), and optionally cache, hiddens
+            Dict containing logits, loss (if labels provided), and optionally cache, hiddens, pointer_logits
         """
         B, N = input_ids.shape
         device = input_ids.device
@@ -207,9 +211,11 @@ class PointerDecoder(nn.Module):
         
         # Apply pointer layers with reflection support
         idx = None
-        all_pointer_probs = []
+        all_pointer_indices = []  # 存储指针索引
+        all_full_scores = []  # For pointer supervision
         all_hiddens = []  # For distillation
         layer_history = []  # For reflection mechanism
+        pointer_history = []  # For relationship reflection (新增)
         reflection_info = {
             'layer_history': [],  # 每个反思层的历史状态
             'reflection_gates': [],  # 反思门控值
@@ -232,13 +238,31 @@ class PointerDecoder(nn.Module):
                         return module(*inputs)
                     return custom_forward
                 
-                h, idx, p = torch.utils.checkpoint.checkpoint(
+                layer_result = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
-                    h, layer_cache, idx, layer_history,
+                    h, layer_cache, idx, layer_history, return_pointer_logits,
                     use_reentrant=False
                 )
             else:
-                h, idx, p = layer(h, kv_cache=layer_cache, prev_idx=idx, layer_history=layer_history)
+                layer_result = layer(h, kv_cache=layer_cache, prev_idx=idx, layer_history=layer_history, pointer_history=pointer_history, return_full_scores=return_pointer_logits)
+            
+            # Unpack results based on whether full scores were requested
+            if return_pointer_logits:
+                if len(layer_result) == 4:
+                    h, idx, p, full_scores = layer_result
+                    all_full_scores.append(full_scores)
+                else:
+                    h, idx, p = layer_result
+                    # Create dummy full_scores if not returned
+                    B, N = h.shape[:2]
+                    N_cache = cache.max_seq_len if cache else self.max_seq_len
+                    full_scores = torch.zeros(B, N, N_cache, device=h.device)
+                    all_full_scores.append(full_scores)
+            else:
+                if len(layer_result) == 4:
+                    h, idx, p, _ = layer_result  # Ignore full_scores
+                else:
+                    h, idx, p = layer_result
             
             # 如果是反思层，收集反思信息
             if hasattr(layer, 'is_reflection_layer') and layer.is_reflection_layer:
@@ -262,12 +286,23 @@ class PointerDecoder(nn.Module):
             # Store current layer's hidden states for reflection
             layer_history.append(h.detach().clone())  # Detach to avoid gradients through history
             
+            # 🎯 新增：存储指针历史用于关系反思
+            if idx is not None:
+                pointer_history.append(idx.detach().clone())
+            
             # Limit history size to prevent memory explosion
             max_history = self.reflection_config.get('pointer_backtrack_layers', 8)
             if len(layer_history) > max_history:
                 layer_history.pop(0)  # Remove oldest
+            if len(pointer_history) > max_history:
+                pointer_history.pop(0)  # Remove oldest pointer history
             
-            all_pointer_probs.append(p)
+            all_pointer_indices.append(idx)  # 存储指针索引而不是概率
+            
+            # Store pointer indices for stats calculation  
+            if not hasattr(self, '_last_pointer_indices'):
+                self._last_pointer_indices = []
+            self._last_pointer_indices = all_pointer_indices
             
             # Update cache only during inference
             if use_cache and cache and not self.training and layer_cache is not None:
@@ -281,6 +316,27 @@ class PointerDecoder(nn.Module):
         
         
         result = {'logits': logits}
+        
+        # Add pointer logits for supervision if requested
+        if return_pointer_logits:
+            # Use dedicated pointer head for position prediction
+            pointer_logits = self.pointer_head(h)  # [B, N, max_seq_len]
+            
+            # Mask out positions beyond current sequence length
+            B, N = h.shape[:2]
+            seq_len = input_ids.shape[1]
+            if seq_len < self.max_seq_len:
+                # Create mask for valid positions
+                pos_mask = torch.arange(self.max_seq_len, device=h.device).unsqueeze(0).unsqueeze(0)
+                seq_len_mask = pos_mask >= seq_len
+                pointer_logits = pointer_logits.masked_fill(seq_len_mask, float('-inf'))
+            
+            result['pointer_logits'] = pointer_logits
+            
+            # Also keep the internal pointer scores for analysis
+            if all_full_scores:
+                stacked_full_scores = torch.stack(all_full_scores, dim=0)  # [L, B, N, N_cache]
+                result['all_layer_pointer_logits'] = stacked_full_scores
         
         # Calculate loss if labels are provided
         if labels is not None:
@@ -299,10 +355,10 @@ class PointerDecoder(nn.Module):
         
         if use_cache and not self.training:
             result['cache'] = cache
-            result['pointer_probs'] = all_pointer_probs
+            result['pointer_indices'] = all_pointer_indices  # 返回指针索引
         elif self.training:
-            # During training, always return pointer probs for distillation
-            result['pointer_probs'] = all_pointer_probs
+            # During training, return pointer indices for supervision
+            result['pointer_indices'] = all_pointer_indices
             if output_hiddens:
                 result['hiddens'] = all_hiddens
             
@@ -349,3 +405,41 @@ class PointerDecoder(nn.Module):
         with torch.no_grad():
             result = self.forward(input_ids, use_cache=True)
             return result.get('pointer_probs', [])
+
+    def get_pointer_stats(self) -> Dict[str, float]:
+        """Calculate pointer statistics for benchmarking.
+        
+        Returns:
+            Dictionary containing:
+            - pointer_utilization: Ratio of non-trivial pointer usage
+            - avg_hop_distance: Average distance between pointers
+            - entropy: Entropy of pointer distribution (simplified for single pointers)
+        """
+        if not hasattr(self, '_last_pointer_indices'):
+            return {}
+            
+        stats = {}
+        
+        # Use last layer pointer indices [B, N]
+        pointer_indices = self._last_pointer_indices[-1]  # [B, N]
+        B, N = pointer_indices.shape
+        
+        # Calculate pointer utilization (non-self pointers)
+        position_indices = torch.arange(N, device=pointer_indices.device).unsqueeze(0).expand(B, N)
+        self_pointers = (pointer_indices == position_indices).float()
+        stats['pointer_utilization'] = 1 - self_pointers.mean().item()
+        
+        # Calculate average hop distance
+        distances = torch.abs(pointer_indices.float() - position_indices.float())
+        stats['avg_hop_distance'] = distances.mean().item()
+        
+        # Calculate pointer distribution entropy (simplified for single pointers)
+        # Since each position points to exactly one other position, entropy is 0
+        # But for benchmarking compatibility, we calculate distribution across targets
+        unique_targets, counts = torch.unique(pointer_indices.view(-1), return_counts=True)
+        probs = counts.float() / counts.sum()
+        eps = 1e-10
+        entropy = -torch.sum(probs * torch.log(probs + eps))
+        stats['pointer_entropy'] = entropy.item()
+        
+        return stats
