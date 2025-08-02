@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 try:
     from src.layers.alibi import AliBiPositionalEmbedding, apply_alibi_bias
@@ -13,30 +13,66 @@ except ImportError:
 
 
 def gather_by_pointer(src, ptr):
-    """通过指针收集值 - 每个位置只有一个指针指向另一个位置
+    """通过指针收集值 - 支持单指针和多跳指针链
     
     Args:
         src (torch.Tensor): Source tensor [B, N, d]
-        ptr (torch.Tensor): Pointer indices [B, N] - 每个位置指向一个位置
+        ptr (torch.Tensor | List[torch.Tensor]): 指针索引或指针链
+                  [B, N] 或 List[[B, N], ...]
         
     Returns:
-        torch.Tensor: Gathered tensor [B, N, d]
+        torch.Tensor | List[torch.Tensor]: 收集结果
     """
+    if isinstance(ptr, list):
+        return [gather_by_pointer(src, p) for p in ptr]
+    
+    # 原始单指针逻辑
     B, N, d = src.shape
     
     # Clamp indices to valid range
     ptr_clamped = torch.clamp(ptr, 0, N-1)
     
-    # Use advanced indexing: each position points to exactly one other position
-    batch_idx = torch.arange(B, device=src.device)[:, None]  # [B, 1]
+    # 确保ptr_clamped形状正确 [B, N]
+    if ptr_clamped.dim() == 3:
+        ptr_clamped = ptr_clamped.squeeze(-1)
+    
+    # 使用广播索引
+    batch_idx = torch.arange(B, device=src.device)[:, None].expand(B, N)  # [B, N]
     gathered = src[batch_idx, ptr_clamped]  # [B, N, d]
     
     return gathered
 
 
+class PointerChain(nn.Module):
+    """多跳指针链模块"""
+    def __init__(self, d, max_hops=3):
+        super().__init__()
+        self.max_hops = max_hops
+        self.hop_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(max_hops)])
+        self.hop_projs = nn.ModuleList([nn.Linear(d, 1) for _ in range(max_hops)])
+    
+    def forward(self, h, first_hop_ptr):
+        """生成多跳指针链
+        Args:
+            h: [B, N, d] 输入特征
+            first_hop_ptr: [B, N] 第一跳指针
+        Returns:
+            List[[B, N], ...] 多跳指针链
+        """
+        ptr_chain = [first_hop_ptr]
+        for i in range(1, self.max_hops):
+            # 获取上一跳特征
+            hop_feat = gather_by_pointer(h, ptr_chain[-1])
+            # 计算下一跳指针
+            next_ptr = self.hop_projs[i](self.hop_norms[i](hop_feat))
+            next_ptr = torch.sigmoid(next_ptr) * (h.size(1) - 1)
+            ptr_chain.append(next_ptr.round().long())
+        return ptr_chain
+
+
 class PointerBlock(nn.Module):
     """
-    纯关系建模块 - 专注建模 a-->b 的显式关系
+    纯关系建模块 - 支持多跳关系链 (A→B→C→...)
     
     核心设计理念（优化版）：
     1. 每个token直接学习指向哪个token（纯关系建模）
@@ -52,8 +88,9 @@ class PointerBlock(nn.Module):
         max_seq_len (int): Maximum sequence length
     """
     
-    def __init__(self, d, n_heads, n_kv_heads=None, top_k=1, use_value_proj=True, 
-                 use_alibi=False, max_seq_len=4096, addressing_mode='learned'):
+    def __init__(self, d, n_heads, n_kv_heads=None, use_value_proj=True,
+                 use_alibi=False, max_seq_len=4096, addressing_mode='learned',
+                 multi_hop=1, dynamic_threshold=0.3, max_branches=3):  # 动态分叉参数
         super().__init__()
         self.d = d
         self.n_heads = n_heads
@@ -89,6 +126,21 @@ class PointerBlock(nn.Module):
         # 关闭AliBi以提升速度和纯净度
         self.use_alibi = False
         
+        # 多跳指针支持
+        self.multi_hop = multi_hop
+        self.pointer_chain = PointerChain(d, max_hops=multi_hop) if multi_hop > 1 else None
+        
+        # 可学习的动态分叉参数
+        self.dynamic_threshold = nn.Parameter(torch.tensor(dynamic_threshold))
+        self.max_branches = max_branches
+        # 动态分叉学习网络
+        self.branch_learner = nn.Sequential(
+            nn.Linear(d, d//2),
+            nn.GELU(),
+            nn.Linear(d//2, 1),
+            nn.Sigmoid()
+        )
+        
         # Initialize weights
         self._init_weights()
     
@@ -100,68 +152,110 @@ class PointerBlock(nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=init_std)
     
     def _compute_pure_relations(self, h, prev_idx=None):
-        """
-        🎯 纯关系建模：直接学习 a-->b 的显式关系
+        """动态分叉关系建模
         
         Args:
             h (torch.Tensor): Hidden states [B, N, d]
             prev_idx (Optional[torch.Tensor]): Previous layer's relation chain [B, N]
             
         Returns:
-            torch.Tensor: Relation targets [B, N] - 每个token指向的目标token
+            List[torch.Tensor]: 动态生成的分叉指针列表 [B, N]
         """
         B, N, d = h.shape
         device = h.device
         
-        # 🎯 核心：直接学习关系映射
-        # 每个token学习指向哪个位置
-        relation_logits = self.relation_encoder(h).squeeze(-1)  # [B, N]
+        # 计算基础关系强度
+        base_logits = self.relation_encoder(h)  # [B, N, 1]
+        base_strength = torch.sigmoid(base_logits)  # [B, N, 1]
         
-        # 转换为位置索引（更简单直接）
-        relation_targets = torch.sigmoid(relation_logits) * (N - 1)
-        relation_targets = relation_targets.round().long()
-        relation_targets = torch.clamp(relation_targets, 0, N - 1)
+        # 动态分叉决策
+        branch_mask = (base_strength > self.dynamic_threshold).float()  # [B, N, 1]
+        num_branches = torch.clamp(
+            (base_strength / self.dynamic_threshold).round().long(),
+            1, self.max_branches
+        )  # [B, N, 1]
         
-        # 🚀 关系链继承：基于prev_idx形成思维链
+        # 生成多分支指针
+        all_pointers = []
+        for b in range(self.max_branches):
+            # 每个分支有轻微不同的关系计算
+            branch_logits = self.relation_encoder(h + 0.1*b)  # [B, N, 1]
+            branch_logits = branch_logits.squeeze(-1)  # [B, N]
+            branch_targets = torch.sigmoid(branch_logits) * (N - 1)
+            branch_targets = branch_targets.round().long().view(B, N)  # 确保形状为[B, N]
+            
+            # 只保留有效的分支
+            active = (b < num_branches).squeeze(-1)  # [B, N]
+            # 确保zeros_like与branch_targets维度一致
+            zeros = torch.zeros_like(branch_targets)
+            branch_targets = torch.where(
+                active, 
+                branch_targets,
+                zeros)  # 无效分支指向0
+                
+            all_pointers.append(branch_targets)
+        
+        # 主指针总是第一个分支
+        main_ptr = all_pointers[0]
+        
+        # 关系链继承
         if prev_idx is not None:
-            # 策略：后半部分token更倾向于继承关系链
             chain_threshold = N // 2
             should_chain = torch.arange(N, device=device) >= chain_threshold
             should_chain = should_chain.unsqueeze(0).expand(B, N)
-            
-            # 关系链传递：A→B, B→C => A→B→C
             prev_idx_clamped = torch.clamp(prev_idx, 0, N - 1)
-            relation_targets = torch.where(should_chain, prev_idx_clamped, relation_targets)
+            main_ptr = torch.where(should_chain, prev_idx_clamped, main_ptr)
         
-        return relation_targets
+        # 更新第一个分支
+        all_pointers[0] = main_ptr
+        
+        return all_pointers  # List[[B, N], ...]
     
     def _pure_relation_aggregation(self, h, relation_targets):
         """
-        🔥 纯关系信息聚合：处理 a-->b 中的信息传递
+        🔥 纯关系信息聚合：支持动态分叉
         
         Args:
             h (torch.Tensor): Source hidden states [B, N, d]
-            relation_targets (torch.Tensor): Relation targets [B, N]
+            relation_targets (torch.Tensor | List[torch.Tensor]): 
+                 单跳[B, N]或多跳指针链List[[B, N], ...]
             
         Returns:
             torch.Tensor: Relation-aggregated features [B, N, d]
         """
-        B, N, d = h.shape
+        # 处理多跳情况
+        if isinstance(relation_targets, list) and len(relation_targets) > 0 and isinstance(relation_targets[0], list):
+            # 多跳模式
+            all_relation_feats = []
+            for ptr_chain in relation_targets:
+                chain_feats = []
+                for ptr in ptr_chain:
+                    target_feat = gather_by_pointer(h, ptr)
+                    source_feat = self.value_proj(h)
+                    target_feat = self.value_proj(target_feat)
+                    chain_feats.append(torch.cat([source_feat, target_feat], dim=-1))
+                all_relation_feats.append(torch.mean(torch.stack(chain_feats), dim=0))
+            relation_input = torch.mean(torch.stack(all_relation_feats), dim=0)
+        elif isinstance(relation_targets, list):  # 单指针多跳模式
+            # 最后一跳作为主关系
+            main_ptr = relation_targets[-1]
+            # 聚合多跳信息
+            multi_hop_feats = []
+            for ptr in relation_targets:
+                target_feat = gather_by_pointer(h, ptr)
+                source_feat = self.value_proj(h)
+                target_feat = self.value_proj(target_feat)
+                relation_feat = torch.cat([source_feat, target_feat], dim=-1)
+                multi_hop_feats.append(relation_feat)
+            # 平均多跳特征
+            relation_input = torch.mean(torch.stack(multi_hop_feats), dim=0)
+        else:  # 单跳模式
+            target_feat = gather_by_pointer(h, relation_targets)
+            source_feat = self.value_proj(h)
+            target_feat = self.value_proj(target_feat)
+            relation_input = torch.cat([source_feat, target_feat], dim=-1)
         
-        # 1. 获取关系目标的特征
-        batch_idx = torch.arange(B, device=h.device)[:, None]  # [B, 1]
-        target_features = h[batch_idx, relation_targets]  # [B, N, d]
-        
-        # 2. 关系值投影
-        source_values = self.value_proj(h)  # [B, N, d]
-        target_values = self.value_proj(target_features)  # [B, N, d]
-        
-        # 3. 🎯 核心：关系传递网络处理 source→target 的信息流
-        # 拼接源和目标特征，学习关系传递
-        relation_input = torch.cat([source_values, target_values], dim=-1)  # [B, N, 2d]
-        relation_output = self.relation_transform(relation_input)  # [B, N, d]
-        
-        return relation_output
+        return self.relation_transform(relation_input)
     
     def forward(self, h, kv_cache=None, prev_idx=None, return_full_scores=False):
         """
@@ -210,11 +304,31 @@ class PointerBlock(nn.Module):
             else:
                 return z, relation_targets, relation_strength
         
-        # 🎯 步骤1：学习纯关系 - 每个token学习指向哪个token
-        relation_targets = self._compute_pure_relations(h, prev_idx)  # [B, N]
+        # 🎯 步骤1：学习纯关系
+        first_hop = self._compute_pure_relations(h, prev_idx)  # [B, N] 或 List[[B, N],...]
         
-        # 🔥 步骤2：关系信息聚合 - 处理 a-->b 的信息传递
+        # 多跳指针链生成
+        if self.multi_hop > 1 and self.pointer_chain is not None:
+            if isinstance(first_hop, list):  # 多指针模式
+                relation_targets = [self.pointer_chain(h, ptr) for ptr in first_hop]
+            else:  # 单指针模式
+                relation_targets = self.pointer_chain(h, first_hop)
+        else:
+            relation_targets = first_hop
+        
+        # 🔥 步骤2：关系信息聚合 (自动处理单跳/多跳)
         relation_output = self._pure_relation_aggregation(h, relation_targets)  # [B, N, d]
+        
+        # 统一返回格式
+        if isinstance(relation_targets, list) and isinstance(relation_targets[0], list):
+            # 多指针+多跳模式: 返回第一个指针链作为主指针
+            main_ptr = relation_targets[0][-1]  # 取第一个指针链的最后一跳
+        elif isinstance(relation_targets, list):
+            # 多指针单跳模式: 返回第一个指针作为主指针
+            main_ptr = relation_targets[0]
+        else:
+            # 单指针模式
+            main_ptr = relation_targets
         
         # 🚀 步骤3：输出投影
         z = self.o_proj(relation_output)
@@ -234,6 +348,6 @@ class PointerBlock(nn.Module):
             relation_targets_clamped = torch.clamp(relation_targets, 0, N_cache - 1)
             full_scores[batch_idx, seq_idx, relation_targets_clamped] = relation_strength
             
-            return z, relation_targets, relation_strength, full_scores
+            return z, main_ptr, relation_strength, full_scores
         else:
-            return z, relation_targets, relation_strength
+            return z, main_ptr, relation_strength

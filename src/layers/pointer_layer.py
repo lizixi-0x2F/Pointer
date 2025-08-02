@@ -41,8 +41,9 @@ class PointerLayer(nn.Module):
         reflection_config (dict): Reflection configuration parameters
     """
     
-    def __init__(self, d, n_heads, layer_idx=0, n_kv_heads=None, top_k=2, d_ff=None, dropout=0.0, 
-                 use_value_proj=True, use_alibi=True, max_seq_len=4096, reflection_config=None):
+    def __init__(self, d, n_heads, layer_idx=0, n_kv_heads=None, d_ff=None, dropout=0.0,
+                 use_value_proj=True, use_alibi=True, max_seq_len=4096, reflection_config=None,
+                 dynamic_threshold=0.3, max_branches=3):
         super().__init__()
         self.d = d
         self.layer_idx = layer_idx
@@ -50,7 +51,7 @@ class PointerLayer(nn.Module):
         # Reflection configuration
         self.reflection_config = reflection_config or {}
         self.is_reflection_layer = layer_idx in self.reflection_config.get('reflection_layers', [])
-        self.backtrack_layers = self.reflection_config.get('pointer_backtrack_layers', 8)
+        # 移除backtrack_layers限制，改为使用全部历史层
         
         # DeepSeek-style RMSNorm (Pre-norm architecture)
         self.norm1 = RMSNorm(d)
@@ -58,13 +59,14 @@ class PointerLayer(nn.Module):
         
         # Pointer block (using AliBi)
         self.pointer_block = PointerBlock(
-            d=d, 
+            d=d,
             n_heads=n_heads,
             n_kv_heads=n_kv_heads,
-            top_k=top_k,
             use_value_proj=use_value_proj,
             use_alibi=use_alibi,
-            max_seq_len=max_seq_len
+            max_seq_len=max_seq_len,
+            dynamic_threshold=dynamic_threshold,
+            max_branches=max_branches
         )
         
         # Learnable gate for pointer output (preserves original design)
@@ -92,9 +94,9 @@ class PointerLayer(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        print(f"PointerLayer {layer_idx} initialized (DeepSeek style): d={d}, n_heads={n_heads}, top_k={top_k}")
+        print(f"PointerLayer {layer_idx} initialized (DynamicPointer): d={d}, n_heads={n_heads}, branches={max_branches}")
     
-    def _apply_reflection_mechanism(self, h, layer_history=None, pointer_history=None):
+    def _apply_reflection_mechanism(self, h, layer_history=None, pointer_history=None, return_gates=False):
         """Apply enhanced reflection mechanism for pure relation modeling.
         
         在纯关系建模范式下，反思机制专注于关系链的学习和传承：
@@ -106,18 +108,24 @@ class PointerLayer(nn.Module):
             h (torch.Tensor): Current hidden states [B, N, d]
             layer_history (List[torch.Tensor]): History of hidden states from previous layers
             pointer_history (List[torch.Tensor]): History of relation targets from previous layers
+            return_gates (bool): Whether to return gate values
             
         Returns:
-            torch.Tensor: Reflection-enhanced hidden states [B, N, d]
+            torch.Tensor | Tuple[torch.Tensor, torch.Tensor]: 
+                Reflection-enhanced hidden states [B, N, d]
+                If return_gates=True, also returns gate values [B, N]
         """
         if not self.is_reflection_layer or layer_history is None:
             # 保存原始特征用于损失计算
             self.last_reflection_features = h.clone() if self.is_reflection_layer else None
             return h
         
-        # Get relevant history (last N layers for backtracking)
-        relevant_history = layer_history[-self.backtrack_layers:] if len(layer_history) >= self.backtrack_layers else layer_history
-        relevant_pointers = pointer_history[-self.backtrack_layers:] if pointer_history and isinstance(pointer_history, list) and len(pointer_history) >= self.backtrack_layers else (pointer_history if isinstance(pointer_history, list) else [])
+        # 使用全部历史层进行全局回溯
+        relevant_history = layer_history[:] if layer_history else []
+        relevant_pointers = pointer_history[:] if pointer_history and isinstance(pointer_history, list) else []
+        
+        # 构建全局关系图
+        global_relation_graph = self._build_global_relation_graph(relevant_pointers, h.device)
         
         if not relevant_history:
             self.last_reflection_features = h.clone()
@@ -148,29 +156,47 @@ class PointerLayer(nn.Module):
         # 保存反思特征用于损失计算
         self.last_reflection_features = reflection_features.clone()
         
+        if return_gates:
+            # 返回门控值 (取动态门控的平均值)
+            gate_values = dynamic_gate.mean(dim=-1)  # [B, N]
+            return reflected_h, gate_values
         return reflected_h
     
+    def _build_global_relation_graph(self, pointer_history, device):
+        """构建全局关系图"""
+        if not pointer_history:
+            return None
+            
+        B, N = pointer_history[0].shape
+        # 初始化关系图 [B, N, N]
+        relation_graph = torch.zeros(B, N, N, device=device)
+        
+        # 统计所有历史层的关系
+        for ptr in pointer_history:
+            batch_idx = torch.arange(B, device=device)[:, None, None]
+            seq_idx = torch.arange(N, device=device)[None, :, None]
+            ptr_clamped = torch.clamp(ptr, 0, N-1)[..., None]
+            
+            # 在关系图中累加关系出现次数
+            relation_graph[batch_idx, seq_idx, ptr_clamped] += 1
+        
+        # 归一化
+        relation_graph = relation_graph / len(pointer_history)
+        return relation_graph
+
     def _analyze_relation_chains(self, pointer_history, B, N, device):
-        """分析关系链的一致性和质量"""
+        """分析关系链的一致性和质量(全局版本)"""
         if not pointer_history:
             return torch.ones(B, N, device=device)
         
-        # 统计关系稳定性：每个位置在历史中的指向一致性
+        # 使用全局关系图分析
+        relation_graph = self._build_global_relation_graph(pointer_history, device)
+        
+        # 计算每个位置的全局关系稳定性
         chain_stability = torch.zeros(B, N, device=device)
-        
-        if len(pointer_history) >= 2:
-            # 计算相邻层之间的关系一致性
-            for i in range(len(pointer_history) - 1):
-                curr_pointers = pointer_history[i]  # [B, N]
-                next_pointers = pointer_history[i + 1]  # [B, N]
-                
-                # 关系一致性：相邻层指向同一目标的程度
-                consistency = (curr_pointers == next_pointers).float()
-                chain_stability += consistency
-        
-        # 归一化稳定性分数
-        if len(pointer_history) > 1:
-            chain_stability = chain_stability / (len(pointer_history) - 1)
+        if relation_graph is not None:
+            # 稳定性 = 主要关系占比
+            chain_stability = relation_graph.max(dim=-1).values
         
         # 加入位置偏好：前面的token更容易形成稳定关系
         position_bias = torch.linspace(1.0, 0.5, N, device=device).unsqueeze(0).expand(B, N)
@@ -216,34 +242,35 @@ class PointerLayer(nn.Module):
         return relation_context
     
     def _compute_relation_quality(self, pointer_history, consistency):
-        """计算关系质量分数，用于动态门控"""
+        """计算关系质量分数，用于动态门控(全局版本)"""
         if not pointer_history:
             return torch.ones_like(consistency)
         
-        # 质量基于：1) 一致性 2) 多样性 3) 非自指程度
         B, N = consistency.shape
         device = consistency.device
         
-        quality_score = consistency.clone()  # 基础一致性
+        # 使用全局关系图计算质量
+        relation_graph = self._build_global_relation_graph(pointer_history, device)
+        if relation_graph is None:
+            return consistency
         
-        if pointer_history:
-            # 计算关系多样性（避免所有位置都指向同一个位置）
-            last_pointers = pointer_history[-1]  # [B, N]
-            
-            for b in range(B):
-                unique_targets = torch.unique(last_pointers[b])
-                diversity = len(unique_targets) / N  # 多样性比例
-                quality_score[b] *= (0.5 + 0.5 * diversity)  # 奖励多样性
-            
-            # 惩罚自指关系
-            position_indices = torch.arange(N, device=device).unsqueeze(0).expand(B, N)
-            self_pointing = (last_pointers == position_indices).float()
-            quality_score = quality_score * (1.0 - 0.3 * self_pointing)  # 轻微惩罚自指
+        # 质量基于：
+        # 1) 主要关系占比 (consistency)
+        # 2) 关系多样性 (1 - 主要关系占比)
+        # 3) 非自指程度
+        quality_score = consistency.clone()
         
-        # 确保质量分数在合理范围内
-        quality_score = torch.clamp(quality_score, 0.1, 1.0)
+        # 计算全局多样性 (1 - 主要关系占比)
+        main_relation_ratio = relation_graph.max(dim=-1).values
+        diversity = 1.0 - main_relation_ratio
+        quality_score = quality_score * (0.7 + 0.3 * diversity)  # 适当奖励多样性
         
-        return quality_score
+        # 惩罚自指关系 (使用全局关系图中的自指比例)
+        position_indices = torch.arange(N, device=device)[None, :, None]
+        self_pointing = relation_graph.gather(-1, position_indices).squeeze(-1)
+        quality_score = quality_score * (1.0 - 0.5 * self_pointing)  # 更强惩罚自指
+        
+        return torch.clamp(quality_score, 0.1, 1.0)
     
     def forward(self, h, kv_cache=None, prev_idx=None, layer_history=None, pointer_history=None, return_full_scores=False):
         """DeepSeek-style forward pass with Pre-norm architecture and reflection support.

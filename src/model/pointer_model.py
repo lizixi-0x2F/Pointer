@@ -127,11 +127,12 @@ class PointerDecoder(nn.Module):
                 n_heads=n_heads,
                 layer_idx=layer_idx,  # Pass layer index for reflection control
                 n_kv_heads=self.n_kv_heads,
-                top_k=top_k,
                 d_ff=self.d_ff,
                 dropout=dropout,
                 max_seq_len=max_seq_len,
-                reflection_config=self.reflection_config  # Pass reflection config
+                reflection_config=self.reflection_config,  # Pass reflection config
+                dynamic_threshold=0.3,
+                max_branches=3
             ) for layer_idx in range(n_layers)
         ])
         
@@ -187,7 +188,7 @@ class PointerDecoder(nn.Module):
         Args:
             input_ids (torch.Tensor): Input token IDs [B, N]
             attention_mask (Optional[torch.Tensor]): Attention mask [B, N]
-            labels (Optional[torch.Tensor]): Target labels for computing loss [B, N]
+            labels (Optional[torch.Tensor]): Target labels for computing loss [B] (classification) or [B, N] (language modeling)
             use_cache (bool): Whether to use/return cache
             cache (Optional[List]): Cache from previous forward passes
             output_hiddens (bool): Whether to return hidden states for distillation
@@ -308,14 +309,33 @@ class PointerDecoder(nn.Module):
             if use_cache and cache and not self.training and layer_cache is not None:
                 layer_cache.append(h)
         
-        # Final layer norm and projection
+        # Final layer norm
         h = self.ln_f(h)
         
+        # Classification task (labels shape [B])
+        if labels is not None and labels.dim() == 1:
+            # Enhanced classification with intermediate supervision
+            # 1. Use first token's hidden state for final classification
+            cls_logits = self.lm_head(h[:, 0])  # [B, vocab_size]
             
-        logits = self.lm_head(h)  # [B, N, vocab_size]
-        
-        
-        result = {'logits': logits}
+            # 2. Add intermediate supervision from pointer layers
+            pointer_supervision = []
+            for i, ptr in enumerate(all_pointer_indices):
+                if ptr is not None:
+                    # Gather features from pointer targets
+                    ptr_features = self.gather_by_pointer(h, ptr)
+                    # Simple projection for supervision
+                    ptr_logits = self.lm_head(ptr_features.mean(dim=1))  # [B, vocab_size]
+                    pointer_supervision.append(ptr_logits)
+            
+            result = {
+                'logits': cls_logits,
+                'pointer_logits': pointer_supervision
+            }
+        else:
+            # Language modeling task (labels shape [B, N])
+            logits = self.lm_head(h)  # [B, N, vocab_size]
+            result = {'logits': logits}
         
         # Add pointer logits for supervision if requested
         if return_pointer_logits:
@@ -340,17 +360,21 @@ class PointerDecoder(nn.Module):
         
         # Calculate loss if labels are provided
         if labels is not None:
-            # Shift labels for causal LM: predict next token
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            if labels.dim() == 1:  # Classification task
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(result['logits'], labels)
+            else:  # Language modeling task
+                # Shift labels for causal LM: predict next token
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                # Flatten for cross entropy calculation
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+                shift_labels = shift_labels.view(-1)
+                
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fct(shift_logits, shift_labels)
             
-            # Flatten for cross entropy calculation
-            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-            shift_labels = shift_labels.view(-1)
-            
-            # Calculate cross entropy loss
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits, shift_labels)
             result['loss'] = loss
         
         if use_cache and not self.training:
@@ -405,6 +429,21 @@ class PointerDecoder(nn.Module):
         with torch.no_grad():
             result = self.forward(input_ids, use_cache=True)
             return result.get('pointer_probs', [])
+
+    @staticmethod
+    def gather_by_pointer(h: torch.Tensor, ptr: torch.Tensor) -> torch.Tensor:
+        """Gather features from hidden states using pointer indices.
+        
+        Args:
+            h: Hidden states [B, N, d]
+            ptr: Pointer indices [B, N]
+            
+        Returns:
+            Gathered features [B, N, d]
+        """
+        B, N, d = h.shape
+        batch_idx = torch.arange(B, device=h.device).view(B, 1).expand(-1, N)
+        return h[batch_idx, ptr]
 
     def get_pointer_stats(self) -> Dict[str, float]:
         """Calculate pointer statistics for benchmarking.
