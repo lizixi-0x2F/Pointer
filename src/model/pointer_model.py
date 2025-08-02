@@ -131,8 +131,9 @@ class PointerDecoder(nn.Module):
                 dropout=dropout,
                 max_seq_len=max_seq_len,
                 reflection_config=self.reflection_config,  # Pass reflection config
-                dynamic_threshold=0.3,
-                max_branches=3
+                # 移除硬编码的分叉参数，让系统自动决定
+                dynamic_threshold=None,  # 让PointerBlock自动计算阈值
+                max_branches=None       # 让系统根据实际需要动态分叉
             ) for layer_idx in range(n_layers)
         ])
         
