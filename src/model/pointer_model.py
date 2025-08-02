@@ -100,7 +100,7 @@ class PointerDecoder(nn.Module):
         tie_embeddings (bool): Whether to tie input/output embeddings
     """
     
-    def __init__(self, vocab_size, d, n_layers, n_heads, n_kv_heads=None, top_k=2, d_ff=None, 
+    def __init__(self, vocab_size, d, n_layers, n_heads, n_kv_heads=None, d_ff=None, 
                  max_seq_len=4096, dropout=0.0, tie_embeddings=True, fp16=False, reflection_config=None):
         super().__init__()
         self.vocab_size = vocab_size
@@ -131,9 +131,8 @@ class PointerDecoder(nn.Module):
                 dropout=dropout,
                 max_seq_len=max_seq_len,
                 reflection_config=self.reflection_config,  # Pass reflection config
-                # 移除硬编码的分叉参数，让系统自动决定
-                dynamic_threshold=None,  # 让PointerBlock自动计算阈值
-                max_branches=None       # 让系统根据实际需要动态分叉
+                # 使用简化的指针配置 - 专注双向多头机制
+                # 移除动态分叉，使用双向多头指针
             ) for layer_idx in range(n_layers)
         ])
         
@@ -157,7 +156,7 @@ class PointerDecoder(nn.Module):
         
         total_params = sum(p.numel() for p in self.parameters()) / 1e6
         print(f"PointerDecoder initialized: {total_params:.1f}M parameters")
-        print(f"Config: d={d}, layers={n_layers}, heads={n_heads}, kv_heads={self.n_kv_heads}, top_k={top_k}")
+        print(f"Config: d={d}, layers={n_layers}, heads={n_heads}, kv_heads={self.n_kv_heads}, bidirectional_multihead={self.reflection_config.get('bidirectional_multihead', False)}")
         
         # Note: Don't convert to fp16 here, let the trainer handle it
     

@@ -42,20 +42,21 @@ class PointerLayer(nn.Module):
     """
     
     def __init__(self, d, n_heads, layer_idx=0, n_kv_heads=None, d_ff=None, dropout=0.0,
-                 use_value_proj=True, use_alibi=True, max_seq_len=4096, reflection_config=None,
-                 dynamic_threshold=None, max_branches=None):
+                 use_value_proj=True, use_alibi=True, max_seq_len=4096, reflection_config=None):
         super().__init__()
         self.d = d
         self.layer_idx = layer_idx
         
-        # 🔥 可学习的分叉参数：完全由网络学习
-        self.learnable_branch_gate = nn.Linear(d, 1)  # 学习是否分叉
-        self.learnable_branch_count = nn.Linear(d, 4)  # 学习分叉数量(1-4)
-        self.branch_threshold = nn.Parameter(torch.tensor(0.0))  # 可学习的阈值
+        # 移除自动分叉功能 - 专注纯指针关系建模
         
         # 🧠 全局反思机制：每个层都默认具备
         self.reflection_config = reflection_config or {}
-        # 移除特定层配置，所有层都有反思能力
+        # 可学习的全局反思参数
+        self.reflection_history_weight_decay = nn.Parameter(torch.tensor(0.8))  # 可学习的指数衰减
+        self.reflection_current_weight = nn.Parameter(torch.tensor(0.7))  # 可学习的当前状态权重
+        self.reflection_history_weight = nn.Parameter(torch.tensor(0.3))  # 可学习的历史状态权重
+        
+        # 可学习的反思强度和门控
         self.global_reflection_gate = nn.Linear(d, 1)  # 学习何时启用反思
         self.reflection_intensity = nn.Parameter(torch.tensor(0.1))  # 可学习的反思强度
         self.reflection_norm = RMSNorm(d)
@@ -74,7 +75,7 @@ class PointerLayer(nn.Module):
             use_value_proj=use_value_proj,
             use_alibi=use_alibi,
             max_seq_len=max_seq_len,
-            # 不再传入固定的threshold和branches，由layer动态决定
+            # 使用简化的指针配置
         )
         
         # Learnable gate for pointer output (preserves original design)
@@ -93,8 +94,8 @@ class PointerLayer(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        print(f"PointerLayer {layer_idx} initialized (Learnable): d={d}, n_heads={n_heads}, "
-              f"learnable_branching=True, global_reflection=True")
+        print(f"PointerLayer {layer_idx} initialized: d={d}, n_heads={n_heads}, "
+              f"bidirectional_multihead=True, global_reflection=True")
     
     def _apply_global_reflection_mechanism(self, h, layer_history=None, pointer_history=None):
         """Apply learnable global reflection mechanism.
@@ -155,13 +156,13 @@ class PointerLayer(nn.Module):
             return h
         
         # 简单而有效的全局聚合：加权平均历史状态
-        # 权重随历史层的距离递减
+        # 使用可学习的权重参数
         weighted_states = []
         total_weight = 0
         
         for i, hist_state in enumerate(layer_history):
-            # 距离权重：最近的层权重更高
-            weight = 0.8 ** i  # 指数衰减
+            # 距离权重：使用可学习的衰减参数
+            weight = torch.pow(self.reflection_history_weight_decay, i)  # 可学习的指数衰减
             weighted_states.append(weight * hist_state)
             total_weight += weight
         
@@ -170,15 +171,19 @@ class PointerLayer(nn.Module):
         else:
             global_history = layer_history[-1]  # fallback
         
-        # 融合当前状态和全局历史
-        alpha = 0.7  # 当前状态权重
-        beta = 0.3   # 历史状态权重
+        # 融合当前状态和全局历史 - 使用可学习的权重
+        alpha = torch.sigmoid(self.reflection_current_weight)  # 当前状态权重
+        beta = torch.sigmoid(self.reflection_history_weight)   # 历史状态权重
+        # 归一化权重
+        total_weight = alpha + beta
+        alpha = alpha / total_weight
+        beta = beta / total_weight
         global_context = alpha * h + beta * global_history
         
         return global_context
     
     def forward(self, h, kv_cache=None, prev_idx=None, layer_history=None, pointer_history=None, return_full_scores=False):
-        """DeepSeek-style forward pass with learnable branching and global reflection.
+        """DeepSeek-style forward pass with global reflection.
         
         Args:
             h (torch.Tensor): Input hidden states [B, N, d]
@@ -204,16 +209,7 @@ class PointerLayer(nn.Module):
         # Pre-norm: normalize then compute
         h_norm = self.norm1(h)
         
-        # 🔥 可学习分叉决策
-        branch_gate_logits = self.learnable_branch_gate(h_norm)  # [B, N, 1]
-        branch_count_logits = self.learnable_branch_count(h_norm)  # [B, N, 4]
-        
-        # 决定是否分叉和分叉数量
-        should_branch = torch.sigmoid(branch_gate_logits + self.branch_threshold) > 0.5  # [B, N, 1]
-        branch_count = torch.softmax(branch_count_logits, dim=-1).argmax(dim=-1) + 1  # [B, N] range 1-4
-        
-        # 动态调整PointerBlock的行为（这里需要PointerBlock支持动态参数）
-        # 暂时使用标准的pointer block，后续可以扩展
+        # 使用简化的指针机制，专注关系建模
         pointer_result = self.pointer_block(h_norm, kv_cache, prev_idx=prev_idx, return_full_scores=return_full_scores)
         
         # Always ensure we have the right number of values

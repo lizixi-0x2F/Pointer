@@ -4,3 +4,8 @@ wikitext-2
 standard_benchmark_listops
 __pycache__
 .claude
+abstract_easychair.md
+abstract_perfect.pdf
+generate_heatmap.py
+pointer_heatmap.png
+test_listops_learning.py

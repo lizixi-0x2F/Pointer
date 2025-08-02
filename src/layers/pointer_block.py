@@ -70,27 +70,179 @@ class PointerChain(nn.Module):
         return ptr_chain
 
 
-class PointerBlock(nn.Module):
+class BiDirectionalMultiHeadPointer(nn.Module):
     """
-    纯关系建模块 - 支持多跳关系链 (A→B→C→...)
+    双向多头指针机制 - 支持不同尺度的关系建模
     
-    核心设计理念（优化版）：
-    1. 每个token直接学习指向哪个token（纯关系建模）
-    2. 关系链传递：A→B→C，构成显式思维链
-    3. 去除注意力机制，专注关系表示：用N个关系替代N×N注意力
-    4. 关系作为一等公民：直接建模-->关系，快速构建思维链
-    5. 支持反思门控：利用历史关系链进行推理
+    核心设计理念：
+    1. 双向指针：前向和后向关系建模
+    2. 多头机制：不同头关注不同尺度的关系
+    3. 关系融合：整合多个方向和尺度的信息
     
     Args:
         d (int): Hidden dimension
-        n_heads (int): Number of heads (简化为关系头数)
+        n_heads (int): Number of relation heads
+        max_seq_len (int): Maximum sequence length
+    """
+    
+    def __init__(self, d, n_heads, max_seq_len=4096):
+        super().__init__()
+        self.d = d
+        self.n_heads = n_heads
+        self.head_dim = d // n_heads
+        self.max_seq_len = max_seq_len
+        
+        assert d % n_heads == 0, f"Hidden dim {d} must be divisible by n_heads {n_heads}"
+        
+        # 前向和后向关系编码器
+        self.forward_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d, d // 2),
+                nn.GELU(),
+                nn.Linear(d // 2, 1)
+            ) for _ in range(n_heads)
+        ])
+        
+        self.backward_encoders = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(d, d // 2),
+                nn.GELU(),
+                nn.Linear(d // 2, 1)
+            ) for _ in range(n_heads)
+        ])
+        
+        # 多头值投影
+        self.multi_head_value_proj = nn.ModuleList([
+            nn.Linear(d, self.head_dim, bias=False) for _ in range(n_heads)
+        ])
+        
+        # 双向关系融合网络
+        self.relation_fusion = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.head_dim * 3, self.head_dim),  # [source, forward_target, backward_target]
+                nn.GELU(),
+                nn.Linear(self.head_dim, self.head_dim)
+            ) for _ in range(n_heads)
+        ])
+        
+        # 多头输出融合
+        self.output_proj = nn.Linear(d, d, bias=False)
+        
+        # 可学习的链式传承参数
+        self.chain_threshold_ratio = nn.Parameter(torch.tensor(0.5))  # 可学习的链阈值比例
+        
+        # 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重"""
+        init_std = 0.02 / math.sqrt(self.d)
+        for module_list in [self.multi_head_value_proj]:
+            for module in module_list:
+                if hasattr(module, 'weight'):
+                    nn.init.normal_(module.weight, mean=0.0, std=init_std)
+        
+        if hasattr(self.output_proj, 'weight'):
+            nn.init.normal_(self.output_proj.weight, mean=0.0, std=init_std)
+    
+    def forward(self, h, prev_idx=None):
+        """
+        双向多头指针前向传播
+        
+        Args:
+            h (torch.Tensor): Input hidden states [B, N, d]
+            prev_idx (Optional[torch.Tensor]): Previous layer pointers [B, N]
+            
+        Returns:
+            Tuple containing:
+                - output (torch.Tensor): Output features [B, N, d]
+                - forward_pointers (torch.Tensor): Forward pointers [B, N]
+                - backward_pointers (torch.Tensor): Backward pointers [B, N]
+                - relation_strength (torch.Tensor): Combined relation strength [B, N]
+        """
+        B, N, d = h.shape
+        device = h.device
+        
+        all_head_outputs = []
+        all_forward_pointers = []
+        all_backward_pointers = []
+        all_strengths = []
+        
+        for head_idx in range(self.n_heads):
+            # 计算前向和后向关系
+            forward_logits = self.forward_encoders[head_idx](h).squeeze(-1)  # [B, N]
+            backward_logits = self.backward_encoders[head_idx](h).squeeze(-1)  # [B, N]
+            
+            # 转换为可微分的指针位置 (使用softmax分布而不是硬位置)
+            forward_probs = torch.softmax(forward_logits.unsqueeze(-1).expand(-1, -1, N), dim=-1)  # [B, N, N]
+            backward_probs = torch.softmax(backward_logits.unsqueeze(-1).expand(-1, -1, N), dim=-1)  # [B, N, N]
+            
+            # 计算期望位置用于统计（不参与梯度）
+            position_range = torch.arange(N, device=device, dtype=torch.float).unsqueeze(0).unsqueeze(0)  # [1, 1, N]
+            forward_targets = torch.sum(forward_probs * position_range, dim=-1).long()  # [B, N] 
+            backward_targets = torch.sum(backward_probs * position_range, dim=-1).long()  # [B, N]
+            
+            # 链式传承（如果有前一层的指针）- 使用可学习的阈值
+            if prev_idx is not None:
+                chain_threshold = int(torch.sigmoid(self.chain_threshold_ratio) * N)  # 可学习的阈值
+                should_chain = torch.arange(N, device=device) >= chain_threshold
+                should_chain = should_chain.unsqueeze(0).expand(B, N)
+                prev_idx_clamped = torch.clamp(prev_idx, 0, N - 1)
+                forward_targets = torch.where(should_chain, prev_idx_clamped, forward_targets)
+            
+            # 提取多头特征
+            head_features = self.multi_head_value_proj[head_idx](h)  # [B, N, head_dim]
+            
+            # 可微分的双向特征收集 (使用概率加权)
+            forward_features = torch.bmm(forward_probs, head_features)  # [B, N, head_dim]
+            backward_features = torch.bmm(backward_probs, head_features)  # [B, N, head_dim]
+            
+            # 三元关系融合：[source, forward_target, backward_target]
+            relation_input = torch.cat([head_features, forward_features, backward_features], dim=-1)
+            head_output = self.relation_fusion[head_idx](relation_input)  # [B, N, head_dim]
+            
+            # 计算关系强度 (使用概率分布的集中度)
+            forward_strength = 1.0 - torch.sum(forward_probs * torch.log(forward_probs + 1e-8), dim=-1)  # 熵的负值
+            backward_strength = 1.0 - torch.sum(backward_probs * torch.log(backward_probs + 1e-8), dim=-1)
+            combined_strength = (forward_strength + backward_strength) / 2
+            
+            all_head_outputs.append(head_output)
+            all_forward_pointers.append(forward_targets)
+            all_backward_pointers.append(backward_targets)
+            all_strengths.append(combined_strength)
+        
+        # 多头输出融合
+        multi_head_output = torch.cat(all_head_outputs, dim=-1)  # [B, N, d]
+        final_output = self.output_proj(multi_head_output)
+        
+        # 聚合指针（取第一个头的指针作为主指针）
+        main_forward_ptr = all_forward_pointers[0]
+        main_backward_ptr = all_backward_pointers[0]
+        avg_strength = torch.stack(all_strengths, dim=0).mean(dim=0)
+        
+        return final_output, main_forward_ptr, main_backward_ptr, avg_strength
+
+class PointerBlock(nn.Module):
+    """
+    重构的指针块 - 基于双向多头指针机制
+    
+    核心设计理念：
+    1. 双向关系建模：前向和后向指针
+    2. 多头机制：不同头关注不同尺度的关系
+    3. 多跳支持：可选的指针链传递
+    4. 纯关系专注：去除注意力复杂性，专注关系表示
+    
+    Args:
+        d (int): Hidden dimension
+        n_heads (int): Number of heads
         n_kv_heads (int): Number of key-value heads (for compatibility)
         max_seq_len (int): Maximum sequence length
+        multi_hop (int): Number of hops for pointer chains
     """
     
     def __init__(self, d, n_heads, n_kv_heads=None, use_value_proj=True,
                  use_alibi=False, max_seq_len=4096, addressing_mode='learned',
-                 multi_hop=1, dynamic_threshold=0.3, max_branches=3):  # 动态分叉参数
+                 multi_hop=1):
         super().__init__()
         self.d = d
         self.n_heads = n_heads
@@ -100,166 +252,28 @@ class PointerBlock(nn.Module):
         
         assert d % n_heads == 0, f"Hidden dim {d} must be divisible by n_heads {n_heads}"
         
-        self.heads_per_kv_group = n_heads // self.n_kv_heads
-        
-        # 🎯 核心：纯关系学习网络 - 简化设计
-        # 直接学习 a-->b 的关系映射
-        self.relation_encoder = nn.Sequential(
-            nn.Linear(d, d // 2),
-            nn.GELU(),  # 更稳定的激活函数
-            nn.Linear(d // 2, 1)  # 输出关系强度
-        )
-        
-        # 🚀 关系值投影：将源token特征转换为关系传递的信息
-        self.value_proj = nn.Linear(d, d, bias=False) if use_value_proj else nn.Identity()
-        
-        # 🔥 关系传递网络：处理A→B关系中的信息传递
-        self.relation_transform = nn.Sequential(
-            nn.Linear(d * 2, d),  # 输入：[source_token, target_token]的拼接
-            nn.GELU(),
-            nn.Linear(d, d)
-        )
-        
-        # 简化输出投影
-        self.o_proj = nn.Linear(d, d, bias=False)
-        
-        # 关闭AliBi以提升速度和纯净度
-        self.use_alibi = False
+        # 核心：双向多头指针机制
+        self.bidirectional_pointer = BiDirectionalMultiHeadPointer(d, n_heads, max_seq_len)
         
         # 多跳指针支持
         self.multi_hop = multi_hop
         self.pointer_chain = PointerChain(d, max_hops=multi_hop) if multi_hop > 1 else None
         
-        # 可学习的动态分叉参数
-        self.dynamic_threshold = nn.Parameter(torch.tensor(dynamic_threshold))
-        self.max_branches = max_branches
-        # 动态分叉学习网络
-        self.branch_learner = nn.Sequential(
-            nn.Linear(d, d//2),
-            nn.GELU(),
-            nn.Linear(d//2, 1),
-            nn.Sigmoid()
-        )
+        # 兼容性：保留原有的输出投影
+        self.o_proj = nn.Linear(d, d, bias=False)
         
-        # Initialize weights
+        # 初始化权重
         self._init_weights()
     
     def _init_weights(self):
         """Initialize weights with proper scaling."""
         init_std = 0.02 / math.sqrt(self.d)
-        for module in [self.value_proj, self.o_proj]:
-            if hasattr(module, 'weight'):
-                nn.init.normal_(module.weight, mean=0.0, std=init_std)
-    
-    def _compute_pure_relations(self, h, prev_idx=None):
-        """动态分叉关系建模
-        
-        Args:
-            h (torch.Tensor): Hidden states [B, N, d]
-            prev_idx (Optional[torch.Tensor]): Previous layer's relation chain [B, N]
-            
-        Returns:
-            List[torch.Tensor]: 动态生成的分叉指针列表 [B, N]
-        """
-        B, N, d = h.shape
-        device = h.device
-        
-        # 计算基础关系强度
-        base_logits = self.relation_encoder(h)  # [B, N, 1]
-        base_strength = torch.sigmoid(base_logits)  # [B, N, 1]
-        
-        # 动态分叉决策
-        branch_mask = (base_strength > self.dynamic_threshold).float()  # [B, N, 1]
-        num_branches = torch.clamp(
-            (base_strength / self.dynamic_threshold).round().long(),
-            1, self.max_branches
-        )  # [B, N, 1]
-        
-        # 生成多分支指针
-        all_pointers = []
-        for b in range(self.max_branches):
-            # 每个分支有轻微不同的关系计算
-            branch_logits = self.relation_encoder(h + 0.1*b)  # [B, N, 1]
-            branch_logits = branch_logits.squeeze(-1)  # [B, N]
-            branch_targets = torch.sigmoid(branch_logits) * (N - 1)
-            branch_targets = branch_targets.round().long().view(B, N)  # 确保形状为[B, N]
-            
-            # 只保留有效的分支
-            active = (b < num_branches).squeeze(-1)  # [B, N]
-            # 确保zeros_like与branch_targets维度一致
-            zeros = torch.zeros_like(branch_targets)
-            branch_targets = torch.where(
-                active, 
-                branch_targets,
-                zeros)  # 无效分支指向0
-                
-            all_pointers.append(branch_targets)
-        
-        # 主指针总是第一个分支
-        main_ptr = all_pointers[0]
-        
-        # 关系链继承
-        if prev_idx is not None:
-            chain_threshold = N // 2
-            should_chain = torch.arange(N, device=device) >= chain_threshold
-            should_chain = should_chain.unsqueeze(0).expand(B, N)
-            prev_idx_clamped = torch.clamp(prev_idx, 0, N - 1)
-            main_ptr = torch.where(should_chain, prev_idx_clamped, main_ptr)
-        
-        # 更新第一个分支
-        all_pointers[0] = main_ptr
-        
-        return all_pointers  # List[[B, N], ...]
-    
-    def _pure_relation_aggregation(self, h, relation_targets):
-        """
-        🔥 纯关系信息聚合：支持动态分叉
-        
-        Args:
-            h (torch.Tensor): Source hidden states [B, N, d]
-            relation_targets (torch.Tensor | List[torch.Tensor]): 
-                 单跳[B, N]或多跳指针链List[[B, N], ...]
-            
-        Returns:
-            torch.Tensor: Relation-aggregated features [B, N, d]
-        """
-        # 处理多跳情况
-        if isinstance(relation_targets, list) and len(relation_targets) > 0 and isinstance(relation_targets[0], list):
-            # 多跳模式
-            all_relation_feats = []
-            for ptr_chain in relation_targets:
-                chain_feats = []
-                for ptr in ptr_chain:
-                    target_feat = gather_by_pointer(h, ptr)
-                    source_feat = self.value_proj(h)
-                    target_feat = self.value_proj(target_feat)
-                    chain_feats.append(torch.cat([source_feat, target_feat], dim=-1))
-                all_relation_feats.append(torch.mean(torch.stack(chain_feats), dim=0))
-            relation_input = torch.mean(torch.stack(all_relation_feats), dim=0)
-        elif isinstance(relation_targets, list):  # 单指针多跳模式
-            # 最后一跳作为主关系
-            main_ptr = relation_targets[-1]
-            # 聚合多跳信息
-            multi_hop_feats = []
-            for ptr in relation_targets:
-                target_feat = gather_by_pointer(h, ptr)
-                source_feat = self.value_proj(h)
-                target_feat = self.value_proj(target_feat)
-                relation_feat = torch.cat([source_feat, target_feat], dim=-1)
-                multi_hop_feats.append(relation_feat)
-            # 平均多跳特征
-            relation_input = torch.mean(torch.stack(multi_hop_feats), dim=0)
-        else:  # 单跳模式
-            target_feat = gather_by_pointer(h, relation_targets)
-            source_feat = self.value_proj(h)
-            target_feat = self.value_proj(target_feat)
-            relation_input = torch.cat([source_feat, target_feat], dim=-1)
-        
-        return self.relation_transform(relation_input)
+        if hasattr(self.o_proj, 'weight'):
+            nn.init.normal_(self.o_proj.weight, mean=0.0, std=init_std)
     
     def forward(self, h, kv_cache=None, prev_idx=None, return_full_scores=False):
         """
-        纯关系建模的前向传播 - 专注 a-->b 显式关系
+        双向多头指针前向传播
         
         Args:
             h (torch.Tensor): Input hidden states [B, N, d]
@@ -270,13 +284,13 @@ class PointerBlock(nn.Module):
         Returns:
             Tuple containing:
                 - z (torch.Tensor): Output representations [B, N, d]
-                - relation_targets (torch.Tensor): Relation targets [B, N] - each token points to one target
-                - relation_strength (torch.Tensor): Relation strength [B, N] - strength of each relation
+                - main_pointer (torch.Tensor): Main pointer targets [B, N]
+                - relation_strength (torch.Tensor): Relation strength [B, N]
                 - full_scores (Optional): Full scores if requested (for compatibility)
         """
         B, N, d = h.shape
         
-        # 处理缓存（简化版本，专注关系建模）
+        # 处理缓存（简化版本）
         if kv_cache is None:
             h_src = h
             N_cache = N
@@ -296,58 +310,37 @@ class PointerBlock(nn.Module):
         # 边界检查
         if N == 0 or N_cache == 0:
             z = torch.zeros_like(h)
-            relation_targets = torch.zeros(B, N, dtype=torch.long, device=h.device)
+            main_pointer = torch.zeros(B, N, dtype=torch.long, device=h.device)
             relation_strength = torch.zeros(B, N, device=h.device)
             if return_full_scores:
                 full_scores = torch.zeros(B, N, N_cache, device=h.device)
-                return z, relation_targets, relation_strength, full_scores
+                return z, main_pointer, relation_strength, full_scores
             else:
-                return z, relation_targets, relation_strength
+                return z, main_pointer, relation_strength
         
-        # 🎯 步骤1：学习纯关系
-        first_hop = self._compute_pure_relations(h, prev_idx)  # [B, N] 或 List[[B, N],...]
+        # 🎯 核心：双向多头指针计算
+        pointer_output, forward_ptr, backward_ptr, relation_strength = self.bidirectional_pointer(h, prev_idx)
         
-        # 多跳指针链生成
+        # 多跳指针链生成（可选）
         if self.multi_hop > 1 and self.pointer_chain is not None:
-            if isinstance(first_hop, list):  # 多指针模式
-                relation_targets = [self.pointer_chain(h, ptr) for ptr in first_hop]
-            else:  # 单指针模式
-                relation_targets = self.pointer_chain(h, first_hop)
+            forward_chain = self.pointer_chain(h, forward_ptr)
+            main_pointer = forward_chain[-1]  # 最后一跳作为主指针
         else:
-            relation_targets = first_hop
+            main_pointer = forward_ptr  # 前向指针作为主指针
         
-        # 🔥 步骤2：关系信息聚合 (自动处理单跳/多跳)
-        relation_output = self._pure_relation_aggregation(h, relation_targets)  # [B, N, d]
-        
-        # 统一返回格式
-        if isinstance(relation_targets, list) and isinstance(relation_targets[0], list):
-            # 多指针+多跳模式: 返回第一个指针链作为主指针
-            main_ptr = relation_targets[0][-1]  # 取第一个指针链的最后一跳
-        elif isinstance(relation_targets, list):
-            # 多指针单跳模式: 返回第一个指针作为主指针
-            main_ptr = relation_targets[0]
-        else:
-            # 单指针模式
-            main_ptr = relation_targets
-        
-        # 🚀 步骤3：输出投影
-        z = self.o_proj(relation_output)
-        
-        # 计算关系强度（用于兼容性和分析）
-        # 使用关系编码器的输出作为强度指标
-        relation_logits = self.relation_encoder(h).squeeze(-1)  # [B, N]
-        relation_strength = torch.sigmoid(relation_logits)  # [B, N] 归一化到[0,1]
+        # 🚀 输出投影
+        z = self.o_proj(pointer_output)
         
         if return_full_scores:
-            # 为兼容性创建全分数矩阵（实际上是稀疏的）
+            # 为兼容性创建全分数矩阵
             full_scores = torch.zeros(B, N, N_cache, device=h.device)
             
             # 在对应的关系目标位置设置强度
             batch_idx = torch.arange(B, device=h.device)[:, None]
             seq_idx = torch.arange(N, device=h.device)[None, :]
-            relation_targets_clamped = torch.clamp(relation_targets, 0, N_cache - 1)
-            full_scores[batch_idx, seq_idx, relation_targets_clamped] = relation_strength
+            main_ptr_clamped = torch.clamp(main_pointer, 0, N_cache - 1)
+            full_scores[batch_idx, seq_idx, main_ptr_clamped] = relation_strength
             
-            return z, main_ptr, relation_strength, full_scores
+            return z, main_pointer, relation_strength, full_scores
         else:
-            return z, main_ptr, relation_strength
+            return z, main_pointer, relation_strength

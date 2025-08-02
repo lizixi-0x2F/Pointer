@@ -41,6 +41,10 @@ class ALiBiAttention(nn.Module):
         
         # ALiBi slopes
         self.register_buffer('slopes', self._get_alibi_slopes(n_heads))
+        
+        # Cache for computed masks and biases
+        self._cached_masks = {}
+        self._cached_alibi = {}
     
     def _get_alibi_slopes(self, n_heads: int) -> torch.Tensor:
         """Get ALiBi slopes for each head."""
@@ -65,6 +69,7 @@ class ALiBiAttention(nn.Module):
         return_attention: bool = False
     ) -> torch.Tensor:
         B, T, C = x.shape
+        device = x.device
         
         # Project to Q, K, V
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, T, D]
@@ -74,15 +79,28 @@ class ALiBiAttention(nn.Module):
         # Compute attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # [B, H, T, T]
         
-        # Add ALiBi bias
-        # Create position matrix
-        positions = torch.arange(T, device=x.device).unsqueeze(0) - torch.arange(T, device=x.device).unsqueeze(1)
-        alibi_bias = positions.unsqueeze(0).unsqueeze(0) * self.slopes.view(1, -1, 1, 1).to(x.device)
+        # Get or compute cached ALiBi bias
+        cache_key = (T, device, self.n_heads)
+        if cache_key not in self._cached_alibi:
+            # Create position matrix only once per sequence length
+            i = torch.arange(T, device=device)
+            j = torch.arange(T, device=device)
+            positions = i.view(-1, 1) - j.view(1, -1)  # More efficient
+            slopes = self.slopes.to(device).view(1, -1, 1, 1)
+            alibi_bias = positions.unsqueeze(0).unsqueeze(0) * slopes
+            self._cached_alibi[cache_key] = alibi_bias
+        
+        # Use cached bias efficiently
+        alibi_bias = self._cached_alibi[cache_key][:, :self.n_heads, :T, :T]
         scores = scores + alibi_bias
         
-        # Apply causal mask (lower triangular)
-        causal_mask = torch.tril(torch.ones(T, T, device=x.device)).bool()
-        scores = scores.masked_fill(~causal_mask, float('-inf'))
+        # Get or compute cached causal mask
+        mask_cache_key = (T, device)
+        if mask_cache_key not in self._cached_masks:
+            causal_mask = torch.tril(torch.ones(T, T, device=device)).bool()
+            self._cached_masks[mask_cache_key] = causal_mask
+        
+        scores = scores.masked_fill(~self._cached_masks[mask_cache_key], float('-inf'))
         
         # Apply attention mask if provided
         if attention_mask is not None:
@@ -282,16 +300,24 @@ class VanillaTransformerDecoder(nn.Module):
             
             result['pointer_logits'] = pointer_logits
         
-        # Language modeling loss
+        # 自适应损失计算 - 支持分类和语言建模任务
         if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            if labels.dim() == 1:  # 分类任务：labels是[B]
+                # 使用第一个token的logits进行分类
+                cls_logits = logits[:, 0, :]  # [B, vocab_size]
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(cls_logits, labels)
+            else:  # 语言建模任务：labels是[B, N]
+                # 标准的causal language modeling loss
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                
+                shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+                shift_labels = shift_labels.view(-1)
+                
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+                loss = loss_fct(shift_logits, shift_labels)
             
-            shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-            shift_labels = shift_labels.view(-1)
-            
-            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
-            loss = loss_fct(shift_logits, shift_labels)
             result['loss'] = loss
         
         return result
