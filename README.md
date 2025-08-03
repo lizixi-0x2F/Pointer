@@ -51,11 +51,13 @@ Preliminary benchmarks on WikiText-2 demonstrate significant improvements over v
 ## Project Structure
 
 ```
-pointer-networks/
+Pointer/
 ├── src/
 │   ├── model/
+│   │   ├── __init__.py
 │   │   └── pointer_model.py      # Main PointerDecoder implementation
 │   ├── layers/
+│   │   ├── __init__.py
 │   │   ├── pointer_layer.py      # Core pointer layer with reflection
 │   │   ├── pointer_block.py      # Bidirectional pointer mechanism
 │   │   ├── embedding.py          # Token embedding with dropout
@@ -63,16 +65,20 @@ pointer-networks/
 │   │   ├── rmsnorm.py            # RMSNorm implementation
 │   │   └── alibi.py              # ALiBi positional encoding
 │   └── losses/
+│       ├── __init__.py
 │       └── reflection_loss.py    # Specialized loss for reflection training
 ├── benchmarks/
 │   ├── pointer_benchmark.py      # Performance benchmarking suite
 │   └── baselines/
+│       ├── __init__.py
 │       └── vanilla_transformer.py # Transformer baseline comparisons
-├── listops-32/                   # ListOps-32 dataset
 ├── wikitext-2/                   # WikiText-2 dataset
-├── test_listops_learning.py      # Classification task testing
-├── generate_heatmap.py           # Pointer attention visualization
-└── pointer_heatmap.png           # Generated attention heatmap
+│   ├── README.md                 # Dataset configuration
+│   └── data/
+│       ├── train-00000-of-00001.parquet
+│       ├── validation-00000-of-00001.parquet
+│       └── test-00000-of-00001.parquet
+└── README.md                     # This file
 ```
 
 ## Getting Started
@@ -87,27 +93,21 @@ pointer-networks/
 ### Installation
 
 ```bash
-git clone <repository-url>
-cd pointer-networks
+git clone https://github.com/lizixi-0x2F/Pointer
+cd Pointer
 pip install torch datasets tqdm
 ```
 
 ### Quick Start
 
-#### 1. Test ListOps Classification Task
+#### 1. Run Benchmarks
 ```bash
-python test_listops_learning.py
-```
-
-#### 2. Run Benchmarks
-```bash
-python benchmarks/pointer_benchmark.py --dataset listops-32 --model pointer
 python benchmarks/pointer_benchmark.py --dataset wikitext-2 --model pointer
 ```
 
-#### 3. Generate Attention Heatmaps
+#### 2. Compare with Baselines
 ```bash
-python generate_heatmap.py
+python benchmarks/pointer_benchmark.py --dataset wikitext-2 --model transformer
 ```
 
 ### Usage Example
@@ -158,7 +158,7 @@ print(f"Average hop distance: {stats['avg_hop_distance']:.1f}")
 This architecture is particularly well-suited for:
 - **Long-range sequence modeling** with linear complexity
 - **Interpretable AI systems** requiring decision path analysis
-- **Compositional reasoning tasks** with complex dependencies
+- **Language modeling tasks** with efficient processing
 - **Real-time applications** benefiting from faster inference
 - **Multi-scale temporal modeling** across different time horizons
 
