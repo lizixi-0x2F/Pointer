@@ -44,13 +44,16 @@ def gather_by_pointer(src, ptr):
 
 
 class PointerChain(nn.Module):
-    """多跳指针链模块"""
+    """多跳指针链模块 - 使用可学习参数"""
     def __init__(self, d, max_hops=3):
         super().__init__()
         self.max_hops = max_hops
         self.hop_norms = nn.ModuleList([nn.LayerNorm(d) for _ in range(max_hops)])
         self.hop_projs = nn.ModuleList([nn.Linear(d, 1) for _ in range(max_hops)])
-    
+        
+        # 🎯 可学习的跳跃范围参数
+        self.hop_range_scale = nn.Parameter(torch.tensor(0.95))  # 跳跃范围缩放因子
+        
     def forward(self, h, first_hop_ptr):
         """生成多跳指针链
         Args:
@@ -65,7 +68,9 @@ class PointerChain(nn.Module):
             hop_feat = gather_by_pointer(h, ptr_chain[-1])
             # 计算下一跳指针
             next_ptr = self.hop_projs[i](self.hop_norms[i](hop_feat))
-            next_ptr = torch.sigmoid(next_ptr) * (h.size(1) - 1)
+            # 使用可学习的范围缩放
+            range_scale = torch.sigmoid(self.hop_range_scale)
+            next_ptr = torch.sigmoid(next_ptr) * (h.size(1) - 1) * range_scale
             ptr_chain.append(next_ptr.round().long())
         return ptr_chain
 
@@ -130,6 +135,11 @@ class BiDirectionalMultiHeadPointer(nn.Module):
         
         # 可学习的链式传承参数
         self.chain_threshold_ratio = nn.Parameter(torch.tensor(0.5))  # 可学习的链阈值比例
+        
+        # 🎯 NEW: 可学习的计算参数 (替代硬编码)
+        self.entropy_epsilon = nn.Parameter(torch.tensor(1e-8))      # 熵计算的epsilon
+        self.strength_fusion_weight = nn.Parameter(torch.tensor(0.5)) # 前向后向强度融合权重
+        self.relation_balance_weight = nn.Parameter(torch.tensor(1.0)) # 关系平衡权重
         
         # 初始化权重
         self._init_weights()
@@ -201,10 +211,14 @@ class BiDirectionalMultiHeadPointer(nn.Module):
             relation_input = torch.cat([head_features, forward_features, backward_features], dim=-1)
             head_output = self.relation_fusion[head_idx](relation_input)  # [B, N, head_dim]
             
-            # 计算关系强度 (使用概率分布的集中度)
-            forward_strength = 1.0 - torch.sum(forward_probs * torch.log(forward_probs + 1e-8), dim=-1)  # 熵的负值
-            backward_strength = 1.0 - torch.sum(backward_probs * torch.log(backward_probs + 1e-8), dim=-1)
-            combined_strength = (forward_strength + backward_strength) / 2
+            # 计算关系强度 (使用可学习参数替代硬编码)
+            epsilon = torch.relu(self.entropy_epsilon) + 1e-10  # 确保数值稳定
+            forward_strength = 1.0 - torch.sum(forward_probs * torch.log(forward_probs + epsilon), dim=-1)  # 熵的负值
+            backward_strength = 1.0 - torch.sum(backward_probs * torch.log(backward_probs + epsilon), dim=-1)
+            
+            # 使用可学习权重融合前向和后向强度
+            fusion_weight = torch.sigmoid(self.strength_fusion_weight)
+            combined_strength = fusion_weight * forward_strength + (1 - fusion_weight) * backward_strength
             
             all_head_outputs.append(head_output)
             all_forward_pointers.append(forward_targets)

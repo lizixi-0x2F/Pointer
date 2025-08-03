@@ -210,19 +210,12 @@ class PointerDecoder(nn.Module):
                 for _ in range(self.n_layers)
             ]
         
-        # Apply pointer layers with reflection support
+        # Apply pointer layers with pointer-chain reflection
         idx = None
         all_pointer_indices = []  # 存储指针索引
         all_full_scores = []  # For pointer supervision
         all_hiddens = []  # For distillation
-        layer_history = []  # For reflection mechanism
-        pointer_history = []  # For relationship reflection (新增)
-        reflection_info = {
-            'layer_history': [],  # 每个反思层的历史状态
-            'reflection_gates': [],  # 反思门控值
-            'reflection_features': [],  # 反思特征
-            'reflection_layers': []  # 反思层索引
-        }
+        pointer_history = []  # For pointer-chain reflection (轻量级：只存储指针索引)
         
         for i, layer in enumerate(self.layers):
             # Store hidden states for distillation
@@ -241,11 +234,11 @@ class PointerDecoder(nn.Module):
                 
                 layer_result = torch.utils.checkpoint.checkpoint(
                     create_custom_forward(layer),
-                    h, layer_cache, idx, layer_history, return_pointer_logits,
+                    h, layer_cache, idx, pointer_history, return_pointer_logits,
                     use_reentrant=False
                 )
             else:
-                layer_result = layer(h, kv_cache=layer_cache, prev_idx=idx, layer_history=layer_history, pointer_history=pointer_history, return_full_scores=return_pointer_logits)
+                layer_result = layer(h, kv_cache=layer_cache, prev_idx=idx, pointer_history=pointer_history, return_full_scores=return_pointer_logits)
             
             # Unpack results based on whether full scores were requested
             if return_pointer_logits:
@@ -265,36 +258,12 @@ class PointerDecoder(nn.Module):
                 else:
                     h, idx, p = layer_result
             
-            # 如果是反思层，收集反思信息
-            if hasattr(layer, 'is_reflection_layer') and layer.is_reflection_layer:
-                reflection_info['reflection_layers'].append(i)
-                reflection_info['layer_history'].append(layer_history.copy() if layer_history else [])
-                
-                # 获取反思门控值和特征
-                if hasattr(layer, 'reflection_gate') and hasattr(layer, 'last_reflection_features'):
-                    gate_value = layer.reflection_gate.data.mean()  # 简化的门控值
-                    reflection_info['reflection_gates'].append(gate_value.unsqueeze(0).expand(h.shape[0], h.shape[1]))
-                    
-                    if hasattr(layer, 'last_reflection_features') and layer.last_reflection_features is not None:
-                        reflection_info['reflection_features'].append(layer.last_reflection_features)
-                    else:
-                        reflection_info['reflection_features'].append(h.clone())
-                else:
-                    # Fallback: 使用当前隐状态作为反思特征
-                    reflection_info['reflection_gates'].append(torch.ones_like(h[:, :, 0]))
-                    reflection_info['reflection_features'].append(h.clone())
-            
-            # Store current layer's hidden states for reflection
-            layer_history.append(h.detach().clone())  # Detach to avoid gradients through history
-            
-            # 🎯 新增：存储指针历史用于关系反思
+            # 🎯 存储指针历史用于轻量级反思 (只存储指针索引，O(L*N)而非O(L*N*d))
             if idx is not None:
                 pointer_history.append(idx.detach().clone())
             
-            # Limit history size to prevent memory explosion
-            max_history = self.reflection_config.get('pointer_backtrack_layers', 8)
-            if len(layer_history) > max_history:
-                layer_history.pop(0)  # Remove oldest
+            # 限制指针历史大小防止内存爆炸
+            max_history = self.reflection_config.get('max_history_layers', 8)
             if len(pointer_history) > max_history:
                 pointer_history.pop(0)  # Remove oldest pointer history
             
@@ -385,10 +354,6 @@ class PointerDecoder(nn.Module):
             result['pointer_indices'] = all_pointer_indices
             if output_hiddens:
                 result['hiddens'] = all_hiddens
-            
-            # 返回反思信息用于反思损失计算
-            if reflection_info['reflection_layers']:
-                result['reflection_outputs'] = reflection_info
             
         return result
     

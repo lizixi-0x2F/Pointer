@@ -125,7 +125,7 @@ def load_dataset(dataset_name):
     return train, val, test, vocab_size, max_len, preprocess
 
 def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metrics=False, max_steps=None):
-    """训练模型并评估 - 支持按步数或epoch数训练"""
+    """训练模型并评估 - 使用困惑度而非准确率"""
     if torch.backends.mps.is_available():
         device = "mps"
     elif torch.cuda.is_available():
@@ -139,14 +139,14 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
     # 跟踪训练指标
     training_metrics = {
         'train_losses': [],
-        'train_accs': [],
+        'train_perplexities': [],  # 🎯 改为困惑度
         'val_losses': [],
-        'val_accs': [],
-        'pointer_stats': []  # 新增：指针统计信息
+        'val_perplexities': [],   # 🎯 改为困惑度  
+        'pointer_stats': []
     }
     
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(ignore_index=0)  # 忽略padding
     
     if max_steps is not None:
         print(f"Training for {max_steps} steps (1 epoch)")
@@ -158,9 +158,9 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
     
     for epoch in range(epochs):
         model.train()
-        train_loss = 0
-        correct = 0
-        total = 0
+        total_loss = 0.0
+        total_tokens = 0  # 🎯 计算困惑度需要token数量
+        num_batches = 0
         
         if max_steps is not None:
             # 使用步数限制的进度条
@@ -188,13 +188,34 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
                 if labels.dim() == 1:  # 分类任务：labels是[B]
                     # logits应该是[B, num_classes]
                     if logits.dim() == 3:  # 如果是[B, N, vocab_size]，取第一个token
-                        logits = logits[:, 0, :]  # [B, vocab_size]
-                    loss = criterion(logits, labels)
+                        logits_flat = logits[:, 0, :]  # [B, vocab_size]
+                        labels_flat = labels
+                    else:
+                        logits_flat = logits
+                        labels_flat = labels
+                    loss = criterion(logits_flat, labels_flat)
+                    
+                    # 分类任务token数量处理
+                    with torch.no_grad():
+                        valid_tokens = labels_flat.size(0)
+                        total_tokens += valid_tokens
+                        total_loss += loss.item() * valid_tokens
+                        
                 else:  # 语言建模任务：labels是[B, N]
                     if logits.dim() == 3:  # [B, N, vocab_size]
-                        logits = logits.view(-1, logits.size(-1))
-                        labels = labels.view(-1)
-                    loss = criterion(logits, labels)
+                        logits_flat = logits.view(-1, logits.size(-1))
+                        labels_flat = labels.view(-1)
+                    else:
+                        logits_flat = logits
+                        labels_flat = labels
+                    loss = criterion(logits_flat, labels_flat)
+                    
+                    # 🎯 计算困惑度相关指标 - 只计算非padding token
+                    with torch.no_grad():
+                        valid_tokens = (labels_flat != 0).sum().item()
+                        if valid_tokens > 0:
+                            total_tokens += valid_tokens
+                            total_loss += loss.item() * valid_tokens  # 加权loss
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -213,19 +234,22 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
                 
                 optimizer.step()
                 
-                train_loss += loss.item()
-                _, predicted = logits.max(1)
-                correct += predicted.eq(labels).sum().item()
-                total += labels.size(0)
-                
+                num_batches += 1
                 global_step += 1
+                
+                # 🎯 计算当前困惑度用于显示
+                if total_tokens > 0:
+                    avg_loss = total_loss / total_tokens
+                    current_perplexity = torch.exp(torch.tensor(avg_loss)).item()
+                else:
+                    current_perplexity = float('inf')
                 
                 # 更新进度条显示
                 progress_bar.update(1)
                 progress_bar.set_postfix({
                     'Step': f"{global_step}/{max_steps}",
                     'Loss': f"{loss.item():.4f}",
-                    'Acc': f"{100.*correct/total:.2f}%"
+                    'PPL': f"{current_perplexity:.2f}"  # 🎯 显示困惑度而非准确率
                 })
                 
         else:
@@ -246,13 +270,34 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
                 if labels.dim() == 1:  # 分类任务：labels是[B]
                     # logits应该是[B, num_classes]
                     if logits.dim() == 3:  # 如果是[B, N, vocab_size]，取第一个token
-                        logits = logits[:, 0, :]  # [B, vocab_size]
-                    loss = criterion(logits, labels)
+                        logits_flat = logits[:, 0, :]  # [B, vocab_size]
+                        labels_flat = labels
+                    else:
+                        logits_flat = logits
+                        labels_flat = labels
+                    loss = criterion(logits_flat, labels_flat)
+                    
+                    # 分类任务token数量处理
+                    with torch.no_grad():
+                        valid_tokens = labels_flat.size(0)
+                        total_tokens += valid_tokens
+                        total_loss += loss.item() * valid_tokens
+                        
                 else:  # 语言建模任务：labels是[B, N]
                     if logits.dim() == 3:  # [B, N, vocab_size]
-                        logits = logits.view(-1, logits.size(-1))
-                        labels = labels.view(-1)
-                    loss = criterion(logits, labels)
+                        logits_flat = logits.view(-1, logits.size(-1))
+                        labels_flat = labels.view(-1)
+                    else:
+                        logits_flat = logits
+                        labels_flat = labels
+                    loss = criterion(logits_flat, labels_flat)
+                    
+                    # 🎯 计算困惑度相关指标 - 只计算非padding token
+                    with torch.no_grad():
+                        valid_tokens = (labels_flat != 0).sum().item()
+                        if valid_tokens > 0:
+                            total_tokens += valid_tokens
+                            total_loss += loss.item() * valid_tokens  # 加权loss
                 
                 optimizer.zero_grad()
                 loss.backward()
@@ -274,11 +319,11 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
         # 关闭进度条
         progress_bar.close()
         
-        # 验证
+        # 🎯 验证阶段：计算困惑度
         model.eval()
-        val_loss = 0
-        val_correct = 0
-        val_total = 0
+        val_total_loss = 0.0
+        val_total_tokens = 0
+        val_num_batches = 0
         
         with torch.no_grad():
             for batch in val_loader:
@@ -291,22 +336,22 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
                 outputs = model(inputs, attention_mask=attention_mask, labels=labels)
                 logits = outputs["logits"]
                 
-                # 检查任务类型：分类 vs 语言建模
-                if labels.dim() == 1:  # 分类任务：labels是[B]
-                    # logits应该是[B, num_classes]
-                    if logits.dim() == 3:  # 如果是[B, N, vocab_size]，取第一个token
-                        logits = logits[:, 0, :]  # [B, vocab_size]
-                    loss = criterion(logits, labels)
-                else:  # 语言建模任务：labels是[B, N]
-                    if logits.dim() == 3:  # [B, N, vocab_size]
-                        logits = logits.view(-1, logits.size(-1))
-                        labels = labels.view(-1)
-                    loss = criterion(logits, labels)
+                # 语言建模任务
+                if logits.dim() == 3:  # [B, N, vocab_size]
+                    logits_flat = logits.view(-1, logits.size(-1))
+                    labels_flat = labels.view(-1)
+                else:
+                    logits_flat = logits
+                    labels_flat = labels
+                    
+                loss = criterion(logits_flat, labels_flat)
                 
-                val_loss += loss.item()
-                _, predicted = logits.max(1)
-                val_correct += predicted.eq(labels).sum().item()
-                val_total += labels.size(0)
+                # 计算有效token数量（排除padding）
+                valid_tokens = (labels_flat != 0).sum().item()
+                if valid_tokens > 0:
+                    val_total_loss += loss.item() * valid_tokens
+                    val_total_tokens += valid_tokens
+                val_num_batches += 1
         
         # 收集指针统计信息（如果是pointer模型）
         if hasattr(model, 'get_pointer_stats'):
@@ -317,26 +362,35 @@ def train_model(model, train_loader, val_loader, epochs=1, lr=0.003, return_metr
                       f"Avg Hop Distance: {pointer_stats.get('avg_hop_distance', 0):.2f}, "
                       f"Entropy: {pointer_stats.get('pointer_entropy', 0):.3f}")
         
-        # 记录训练指标
-        if global_step > 0:  # 确保有训练步数
-            epoch_train_loss = train_loss/global_step if max_steps else train_loss/len(train_loader)
-            epoch_train_acc = 100.*correct/total
-            epoch_val_loss = val_loss/len(val_loader)
-            epoch_val_acc = 100.*val_correct/val_total
+        # 🎯 计算epoch困惑度
+        if total_tokens > 0:
+            epoch_train_loss = total_loss / total_tokens
+            epoch_train_perplexity = torch.exp(torch.tensor(epoch_train_loss)).item()
+        else:
+            epoch_train_loss = float('inf')
+            epoch_train_perplexity = float('inf')
             
-            training_metrics['train_losses'].append(epoch_train_loss)
-            training_metrics['train_accs'].append(epoch_train_acc)
-            training_metrics['val_losses'].append(epoch_val_loss)
-            training_metrics['val_accs'].append(epoch_val_acc)
-
-            if max_steps is not None:
-                print(f"Completed {global_step} steps: "
-                      f"Train Loss: {epoch_train_loss:.4f} | Acc: {epoch_train_acc:.2f}% | "
-                      f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.2f}%")
-            else:
-                print(f"Epoch {epoch+1}: "
-                      f"Train Loss: {epoch_train_loss:.4f} | Acc: {epoch_train_acc:.2f}% | "
-                      f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.2f}%")
+        if val_total_tokens > 0:
+            epoch_val_loss = val_total_loss / val_total_tokens
+            epoch_val_perplexity = torch.exp(torch.tensor(epoch_val_loss)).item()
+        else:
+            epoch_val_loss = float('inf')
+            epoch_val_perplexity = float('inf')
+        
+        # 记录训练指标
+        training_metrics['train_losses'].append(epoch_train_loss)
+        training_metrics['train_perplexities'].append(epoch_train_perplexity)
+        training_metrics['val_losses'].append(epoch_val_loss)
+        training_metrics['val_perplexities'].append(epoch_val_perplexity)
+        
+        if max_steps is not None:
+            print(f"Completed {global_step} steps: "
+                  f"Train Loss: {epoch_train_loss:.4f} | PPL: {epoch_train_perplexity:.2f} | "
+                  f"Val Loss: {epoch_val_loss:.4f} | Val PPL: {epoch_val_perplexity:.2f}")
+        else:
+            print(f"Epoch {epoch+1}: "
+                  f"Train Loss: {epoch_train_loss:.4f} | PPL: {epoch_train_perplexity:.2f} | "
+                  f"Val Loss: {epoch_val_loss:.4f} | Val PPL: {epoch_val_perplexity:.2f}")
         
         # 如果达到最大步数，提前结束
         if max_steps is not None and global_step >= max_steps:
